@@ -43,9 +43,16 @@ save_debug_smali() {
     info "Saving debug smali to ${F1TV_DEBUG_DIR}"
     mkdir -p "${F1TV_DEBUG_DIR}"
 
-    local class
+    # Preserve each class's path under the decompiled root. Several of these
+    # basenames are not unique (BuildConfig.smali exists in both the F1TV and
+    # ClearVR trees), so a flat copy silently loses all but the last match.
+    local class path rel
     for class in "${PATCHED_CLASSES[@]}"; do
-        find "${decompiled}" -name "${class}.smali" -exec cp {} "${F1TV_DEBUG_DIR}/" \; 2>/dev/null || true
+        while IFS= read -r path; do
+            rel="${path#${decompiled}/}"
+            mkdir -p "${F1TV_DEBUG_DIR}/$(dirname "${rel}")"
+            cp "${path}" "${F1TV_DEBUG_DIR}/${rel}"
+        done < <(find "${decompiled}" -name "${class}.smali" 2>/dev/null)
     done
 
     find "${decompiled}" -path '*tiledmedia*' -name '*.smali' 2>/dev/null \
@@ -531,12 +538,20 @@ with open(path, 'r') as f:
 
 # Replace getDefaultDisplaySize() body with a hardcoded 3840x2160 Point.
 # 0xf00 = 3840, 0x870 = 2160. Result is also cached in trueDisplaySize.
-pattern = (
-    r'\.method private static getDefaultDisplaySize\(Landroid/content/Context;\)Landroid/graphics/Point;'
+#
+# The parameter type is captured rather than hardcoded: ClearVR SP164.9.0
+# changed it from Landroid/content/Context; to Landroid/app/Activity;, which
+# silently broke this patch. Reusing whatever the method actually declares
+# keeps the rewrite valid across that kind of signature churn.
+pattern = re.compile(
+    r'\.method private static getDefaultDisplaySize\((?P<arg>L[^;)]+;)\)Landroid/graphics/Point;'
     r'.*?'
-    r'\.end method'
+    r'\.end method',
+    re.DOTALL,
 )
-replacement = """.method private static getDefaultDisplaySize(Landroid/content/Context;)Landroid/graphics/Point;
+
+def replacement(match):
+    return f""".method private static getDefaultDisplaySize({match.group('arg')})Landroid/graphics/Point;
     .locals 3
 
     # UHD Patch: always report a 3840x2160 panel
@@ -546,14 +561,14 @@ replacement = """.method private static getDefaultDisplaySize(Landroid/content/C
 
     const/16 v2, 0x870
 
-    invoke-direct {v0, v1, v2}, Landroid/graphics/Point;-><init>(II)V
+    invoke-direct {{v0, v1, v2}}, Landroid/graphics/Point;-><init>(II)V
 
     sput-object v0, Lcom/tiledmedia/clearvrview/TrueTVDisplaySizeHelper;->trueDisplaySize:Landroid/graphics/Point;
 
     return-object v0
 .end method"""
 
-content, count = re.subn(pattern, replacement, content, flags=re.DOTALL)
+content, count = pattern.subn(replacement, content)
 if count == 0:
     print("ERROR: getDefaultDisplaySize not found", file=sys.stderr)
     sys.exit(1)
