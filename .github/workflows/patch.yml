@@ -426,9 +426,23 @@ jobs:
           KEYSTORE_PATH: ${{ env.KEYSTORE_PATH || '' }}
           KEYSTORE_PASS: ${{ secrets.KEYSTORE_PASS || 'android' }}
           KEYSTORE_ALIAS: ${{ secrets.KEYSTORE_ALIAS || 'f1tvpatch' }}
+          # On failure, patch.sh saves the classes it patches here before
+          # tearing down its temp dir, so a broken smali pattern is diagnosable.
+          F1TV_DEBUG_DIR: ${{ github.workspace }}/debug_smali
+
+      # ── Preserve smali when a patch pattern stops matching ──
+      - name: Upload patch debug smali
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: patch-debug-smali-${{ needs.check.outputs.version_short }}
+          path: debug_smali/
+          retention-days: 14
+          if-no-files-found: warn
 
       # ── Upload artifacts (always, even if release creation fails) ──
       - name: Upload patched APKs
+        if: always() && hashFiles('output/**') != ''
         uses: actions/upload-artifact@v5
         with:
           name: f1tv-uhd-patched-${{ needs.check.outputs.version_short }}

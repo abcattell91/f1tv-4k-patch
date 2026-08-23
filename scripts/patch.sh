@@ -18,11 +18,48 @@ ok()    { echo -e "${GREEN}[+]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[!]${NC} $*"; }
 die()   { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 
+# Classes this script patches. Saved on failure so a pattern that stops
+# matching after an upstream app/SDK update can be diagnosed from the artifact.
+PATCHED_CLASSES=(
+    DeviceSupportImpl
+    DiagnosticsPreferenceManagerImpl
+    TvApplication
+    DecoderCapability
+    Quirks
+    RenderAPIConfig
+    TrueTVDisplaySizeHelper
+    EGLRenderTarget
+    RenderTargetConfig
+    DeviceParameters
+    BuildConfig
+)
+
+# Copy the classes we patch (plus a full tiledmedia class listing, so renamed or
+# relocated classes are visible) into F1TV_DEBUG_DIR. Only runs on failure.
+save_debug_smali() {
+    local decompiled="${WORKDIR}/decompiled"
+    [[ -n "${F1TV_DEBUG_DIR:-}" && -d "${decompiled}" ]] || return 0
+
+    info "Saving debug smali to ${F1TV_DEBUG_DIR}"
+    mkdir -p "${F1TV_DEBUG_DIR}"
+
+    local class
+    for class in "${PATCHED_CLASSES[@]}"; do
+        find "${decompiled}" -name "${class}.smali" -exec cp {} "${F1TV_DEBUG_DIR}/" \; 2>/dev/null || true
+    done
+
+    find "${decompiled}" -path '*tiledmedia*' -name '*.smali' 2>/dev/null \
+        | sed "s|${decompiled}/||" | sort > "${F1TV_DEBUG_DIR}/tiledmedia_classes.txt" || true
+}
+
 cleanup() {
+    local rc=$?
     if [[ -n "${WORKDIR:-}" && -d "${WORKDIR}" ]]; then
+        (( rc != 0 )) && save_debug_smali
         info "Cleaning up ${WORKDIR}"
         rm -rf "${WORKDIR}"
     fi
+    return $rc
 }
 trap cleanup EXIT
 
