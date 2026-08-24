@@ -378,7 +378,7 @@ if [[ -n "${DECODER_CAP_SMALI}" ]]; then
     ok "Found: ${DECODER_CAP_SMALI#${WORKDIR}/}"
     info "Patching ClearVR decoder capability reporting..."
     python3 - "${DECODER_CAP_SMALI}" << 'PYEOF'
-import sys
+import os, sys
 
 smali_path = sys.argv[1]
 with open(smali_path, 'r') as f:
@@ -389,13 +389,26 @@ with open(smali_path, 'r') as f:
 # Devices without a ClearVR quirk profile report 0 for tile slots/rows/cols,
 # causing the backend to serve a lower resolution tier (2880x1620 instead of 3840x2160).
 
-patches = [
-    # Override secureDecoderMaximumTileSlotCount: 0 → 16 (matches Oculus Go/Quest profiles)
-    (
+# maxNumberOfSecureHEVCSamples is the device's real concurrent secure-HEVC
+# session limit. Forcing it high is what unlocks the 2160p tier, but it also
+# tells the backend the device can sustain more simultaneous secure sessions
+# than the hardware may actually have. F1TV_SECURE_HEVC_SAMPLES makes that
+# tunable: an integer to force a specific count, or "keep" to leave the real
+# probed value untouched.
+samples = os.environ.get('F1TV_SECURE_HEVC_SAMPLES', '16').strip() or '16'
+
+patches = []
+if samples.lower() == 'keep':
+    print("  Leaving maxNumberOfSecureHEVCSamples at the hardware-probed value")
+else:
+    n = int(samples, 0)
+    patches.append((
         '    iget v2, p0, Lcom/tiledmedia/clearvrdecoder/util/DecoderCapability;->maxNumberOfSecureHEVCSamples:I',
-        '    const/16 v2, 0x10',
-        'secureDecoderMaximumTileSlotCount → 16'
-    ),
+        f'    const/16 v2, {n:#x}',
+        f'secureDecoderMaximumTileSlotCount → {n}'
+    ))
+
+patches += [
     # Override maxTileRows: 0 → 5 (matches Chromecast/Google TV profile)
     (
         '    iget v2, p0, Lcom/tiledmedia/clearvrdecoder/util/DecoderCapability;->maxTileRows:I',
@@ -419,7 +432,7 @@ for old, new, desc in patches:
     else:
         print(f"  WARNING: Could not find pattern for {desc}, skipping")
 
-if patched == 0:
+if patched == 0 and samples.lower() != 'keep':
     print("ERROR: No ClearVR capability patches applied!", file=sys.stderr)
     sys.exit(1)
 
