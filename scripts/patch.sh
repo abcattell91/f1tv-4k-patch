@@ -520,49 +520,80 @@ fi
 # force direct-to-view on weak/Amlogic GPUs that drop frames on the GL path
 # (accepting the washed-out HDR look as the tradeoff).
 
-RENDER_CONFIG="$(find "${DECOMPILED}" -name 'RenderAPIConfig.smali' -path '*/tiledmedia/*' -print -quit 2>/dev/null || true)"
+# SP164.9.0 moved the blit mode off RenderAPIConfig (which now only carries a
+# colour space) onto ViewRendererConfig, so the old patch silently stopped
+# matching and F1TV_DIRECT_TO_VIEW=1 became a no-op.
+RENDER_CONFIG="$(find "${DECOMPILED}" -name 'ViewRendererConfig.smali' -path '*/tiledmedia/*' -print -quit 2>/dev/null || true)"
 
 if [[ "${F1TV_DIRECT_TO_VIEW:-0}" == "0" ]]; then
     info "Using the EGL/GL render path for correct 4K colours (set F1TV_DIRECT_TO_VIEW=1 for weak/Amlogic GPUs)"
 elif [[ -n "${RENDER_CONFIG}" && -f "${RENDER_CONFIG}" ]]; then
+    ok "Found: ${RENDER_CONFIG#${WORKDIR}/}"
     info "Patching NRP blit mode to direct-to-view (opt-in, for weak/Amlogic GPUs)..."
     python3 - "${RENDER_CONFIG}" << 'PYEOF'
-import sys
+import re, sys
 
 path = sys.argv[1]
 with open(path, 'r') as f:
     content = f.read()
 
-# Patch getNRPTextureBlitMode() to always return NATIVE_ANDROID_DIRECT_TO_VIEW.
-# Original:
-#   iget-object v0, p0, ...->nrpTextureBlitMode
-#   return-object v0
-#
-# Patched:
-#   return NATIVE_ANDROID_DIRECT_TO_VIEW unconditionally
+# Two independent gates decide the render path: callers read the blit mode, and
+# some consult isDirectToViewRenderMode() separately. Force both. Whole method
+# bodies are replaced so the rewrite does not depend on register allocation in
+# the surrounding code.
+patched = 0
 
-old = """    iget-object v0, p0, Lcom/tiledmedia/clearvrview/RenderAPIConfig;->nrpTextureBlitMode:Lcom/tiledmedia/clearvrenums/NRPTextureBlitMode;
+def force(signature, body, label):
+    global content, patched
+    rx = re.compile(signature + r'.*?\.end method', re.DOTALL)
+    content, n = rx.subn(lambda m: body, content, count=1)
+    if n:
+        print(f"  Patched {label}")
+        patched += n
+    else:
+        print(f"  WARNING: {label} not found", file=sys.stderr)
 
-    return-object v0"""
+force(
+    r'\.method public getNRPTextureBlitMode\(\)Lcom/tiledmedia/clearvrenums/NRPTextureBlitMode;',
+    """.method public getNRPTextureBlitMode()Lcom/tiledmedia/clearvrenums/NRPTextureBlitMode;
+    .locals 1
 
-new = """    sget-object v0, Lcom/tiledmedia/clearvrenums/NRPTextureBlitMode;->NATIVE_ANDROID_DIRECT_TO_VIEW:Lcom/tiledmedia/clearvrenums/NRPTextureBlitMode;
+    # UHD Patch: always blit direct to the SurfaceView
+    sget-object v0, Lcom/tiledmedia/clearvrenums/NRPTextureBlitMode;->NATIVE_ANDROID_DIRECT_TO_VIEW:Lcom/tiledmedia/clearvrenums/NRPTextureBlitMode;
 
-    return-object v0"""
+    return-object v0
+.end method""",
+    "getNRPTextureBlitMode -> NATIVE_ANDROID_DIRECT_TO_VIEW",
+)
 
-if old not in content:
-    print(f"Could not find getNRPTextureBlitMode pattern in {path}", file=sys.stderr)
+force(
+    r'\.method public isDirectToViewRenderMode\(\)Z',
+    """.method public isDirectToViewRenderMode()Z
+    .locals 1
+
+    # UHD Patch: always report direct-to-view
+    const/4 v0, 0x1
+
+    return v0
+.end method""",
+    "isDirectToViewRenderMode -> true",
+)
+
+if patched == 0:
+    print("ERROR: no direct-to-view patches applied", file=sys.stderr)
     sys.exit(1)
-
-content = content.replace(old, new, 1)
 
 with open(path, 'w') as f:
     f.write(content)
-print(f"  Patched {path}")
+print(f"Patched {patched}/2 direct-to-view method(s)")
 PYEOF
 
-    [[ $? -eq 0 ]] && ok "NRP direct-to-view patch applied (all devices)" || warn "NRP direct-to-view patch failed"
+    # Explicitly requested, so a failure must not silently fall back to the GL
+    # path -- that is how this patch rotted unnoticed through an SDK bump.
+    [[ $? -eq 0 ]] || die "direct-to-view patch failed"
+    ok "NRP direct-to-view patch applied"
 else
-    warn "RenderAPIConfig.smali not found, skipping direct-to-view patch"
+    die "F1TV_DIRECT_TO_VIEW=1 requested but ViewRendererConfig.smali not found"
 fi
 
 # ─── Force 4K display detection (lifts the 1.5x resolution cap) ─────────────
