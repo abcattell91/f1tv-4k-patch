@@ -32,6 +32,11 @@ on:
         required: false
         type: boolean
         default: false
+      model_spoof:
+        description: "Spoof Build.MODEL as Chromecast (uncheck to let the backend see the real device)"
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -449,6 +454,7 @@ jobs:
           # On failure, patch.sh saves the classes it patches here before
           # tearing down its temp dir, so a broken smali pattern is diagnosable.
           F1TV_SECURE_HEVC_SAMPLES: ${{ inputs.secure_hevc_samples }}
+          F1TV_MODEL_SPOOF: ${{ (github.event_name == 'workflow_dispatch' && !inputs.model_spoof) && '0' || '1' }}
           F1TV_DEBUG_DIR: ${{ github.workspace }}/debug_smali
           F1TV_DEBUG_GREP: ${{ inputs.debug_grep }}
           F1TV_DEBUG_EXTRA_CLASSES: ${{ inputs.debug_extra_classes }}

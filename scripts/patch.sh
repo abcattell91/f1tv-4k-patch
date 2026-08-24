@@ -334,9 +334,15 @@ fi
 
 # ─── Spoof device model in request header ────────────────────────────────────
 
+# The only patch that changes what the backend serves rather than how the
+# device decodes it. Set F1TV_MODEL_SPOOF=0 to let the backend see the real
+# device, e.g. to test whether a content problem is specific to the variant
+# served to the spoofed profile.
 info "Searching for TvApplication.smali..."
 TVAPP_SMALI="$(find "${DECOMPILED}" -name 'TvApplication.smali' -path '*/avs/f1/*' -print -quit)"
-if [[ -n "${TVAPP_SMALI}" ]]; then
+if [[ "${F1TV_MODEL_SPOOF:-1}" == "0" ]]; then
+    warn "F1TV_MODEL_SPOOF=0 — leaving Build.MODEL unspoofed (backend sees the real device)"
+elif [[ -n "${TVAPP_SMALI}" ]]; then
     ok "Found: ${TVAPP_SMALI#${WORKDIR}/}"
     info "Spoofing device model as Chromecast in request header..."
     python3 - "${TVAPP_SMALI}" << 'PYEOF'
