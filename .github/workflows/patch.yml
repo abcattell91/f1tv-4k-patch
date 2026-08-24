@@ -15,6 +15,28 @@ on:
         required: false
         type: boolean
         default: false
+      debug_grep:
+        description: "Regex to search across the decompiled tree (diagnostics)"
+        required: false
+        type: string
+      debug_extra_classes:
+        description: "Extra smali class basenames to collect (space separated)"
+        required: false
+        type: string
+      secure_hevc_samples:
+        description: "maxNumberOfSecureHEVCSamples override: a number, or 'keep' for the probed value"
+        required: false
+        type: string
+      skip_release:
+        description: "Build and upload artifacts only; leave existing releases untouched"
+        required: false
+        type: boolean
+        default: false
+      model_spoof:
+        description: "Spoof Build.MODEL as Chromecast (uncheck to let the backend see the real device)"
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -97,6 +119,9 @@ jobs:
           elif [[ "${{ inputs.force }}" == "true" ]]; then
             echo "should_build=true" >> "$GITHUB_OUTPUT"
             echo "Forced build requested"
+          elif [[ "${{ inputs.skip_release }}" == "true" ]]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "Experiment build requested (no release will be created)"
           elif [[ -n "${{ inputs.apkm_url }}" ]]; then
             echo "should_build=true" >> "$GITHUB_OUTPUT"
             echo "Manual APKM URL provided"
@@ -426,9 +451,29 @@ jobs:
           KEYSTORE_PATH: ${{ env.KEYSTORE_PATH || '' }}
           KEYSTORE_PASS: ${{ secrets.KEYSTORE_PASS || 'android' }}
           KEYSTORE_ALIAS: ${{ secrets.KEYSTORE_ALIAS || 'f1tvpatch' }}
+          # On failure, patch.sh saves the classes it patches here before
+          # tearing down its temp dir, so a broken smali pattern is diagnosable.
+          F1TV_SECURE_HEVC_SAMPLES: ${{ inputs.secure_hevc_samples }}
+          F1TV_MODEL_SPOOF: ${{ (github.event_name == 'workflow_dispatch' && !inputs.model_spoof) && '0' || '1' }}
+          F1TV_DEBUG_DIR: ${{ github.workspace }}/debug_smali
+          F1TV_DEBUG_GREP: ${{ inputs.debug_grep }}
+          F1TV_DEBUG_EXTRA_CLASSES: ${{ inputs.debug_extra_classes }}
+          # Collect diagnostics on a green run too when one was requested.
+          F1TV_DEBUG_ALWAYS: ${{ (inputs.debug_grep != '' || inputs.debug_extra_classes != '') && '1' || '' }}
+
+      # ── Preserve smali when a patch pattern stops matching ──
+      - name: Upload patch debug smali
+        if: always() && hashFiles('debug_smali/**') != ''
+        uses: actions/upload-artifact@v5
+        with:
+          name: patch-debug-smali-${{ needs.check.outputs.version_short }}
+          path: debug_smali/
+          retention-days: 14
+          if-no-files-found: warn
 
       # ── Upload artifacts (always, even if release creation fails) ──
       - name: Upload patched APKs
+        if: always() && hashFiles('output/**') != ''
         uses: actions/upload-artifact@v5
         with:
           name: f1tv-uhd-patched-${{ needs.check.outputs.version_short }}
@@ -438,6 +483,7 @@ jobs:
       # ── Create GitHub Release ──
       - name: Create release
         id: release
+        if: ${{ !inputs.skip_release }}
         run: |
           TAG="v${{ needs.check.outputs.version_short }}"
           TITLE="F1TV UHD Patched - ${{ needs.check.outputs.version }}"

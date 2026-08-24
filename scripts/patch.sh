@@ -18,11 +18,85 @@ ok()    { echo -e "${GREEN}[+]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[!]${NC} $*"; }
 die()   { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 
+# Classes this script patches. Saved on failure so a pattern that stops
+# matching after an upstream app/SDK update can be diagnosed from the artifact.
+PATCHED_CLASSES=(
+    DeviceSupportImpl
+    DiagnosticsPreferenceManagerImpl
+    TvApplication
+    DecoderCapability
+    Quirks
+    RenderAPIConfig
+    TrueTVDisplaySizeHelper
+    EGLRenderTarget
+    RenderTargetConfig
+    DeviceParameters
+    BuildConfig
+)
+
+# Copy the classes we patch (plus a full tiledmedia class listing, so renamed or
+# relocated classes are visible) into F1TV_DEBUG_DIR. Runs on failure, or on any
+# exit when F1TV_DEBUG_ALWAYS is set.
+#
+# Two knobs help investigate runtime faults, where the patch applies cleanly but
+# the app misbehaves on device and the interesting class is unknown up front:
+#   F1TV_DEBUG_EXTRA_CLASSES  space/comma-separated extra class basenames to save
+#   F1TV_DEBUG_GREP           regex searched across the whole decompiled tree;
+#                             writes the matching files and lines to the artifact
+save_debug_smali() {
+    local decompiled="${WORKDIR}/decompiled"
+    [[ -n "${F1TV_DEBUG_DIR:-}" && -d "${decompiled}" ]] || return 0
+
+    info "Saving debug smali to ${F1TV_DEBUG_DIR}"
+    mkdir -p "${F1TV_DEBUG_DIR}"
+
+    # Preserve each class's path under the decompiled root. Several of these
+    # basenames are not unique (BuildConfig.smali exists in both the F1TV and
+    # ClearVR trees), so a flat copy silently loses all but the last match.
+    local class path rel
+    for class in "${PATCHED_CLASSES[@]}"; do
+        while IFS= read -r path; do
+            rel="${path#${decompiled}/}"
+            mkdir -p "${F1TV_DEBUG_DIR}/$(dirname "${rel}")"
+            cp "${path}" "${F1TV_DEBUG_DIR}/${rel}"
+        done < <(find "${decompiled}" -name "${class}.smali" 2>/dev/null)
+    done
+
+    # Opt-in extra classes, same path-preserving copy as above.
+    local extra
+    for extra in ${F1TV_DEBUG_EXTRA_CLASSES//,/ }; do
+        while IFS= read -r path; do
+            rel="${path#${decompiled}/}"
+            mkdir -p "${F1TV_DEBUG_DIR}/$(dirname "${rel}")"
+            cp "${path}" "${F1TV_DEBUG_DIR}/${rel}"
+        done < <(find "${decompiled}" -name "${extra}.smali" 2>/dev/null)
+    done
+
+    # Opt-in tree-wide search, for tracking down an unknown class by a string or
+    # constant seen at runtime (an on-screen error code, say).
+    if [[ -n "${F1TV_DEBUG_GREP:-}" ]]; then
+        info "Searching decompiled tree for: ${F1TV_DEBUG_GREP}"
+        grep -rlE "${F1TV_DEBUG_GREP}" "${decompiled}" --include='*.smali' 2>/dev/null \
+            | sed "s|${decompiled}/||" | sort > "${F1TV_DEBUG_DIR}/grep_files.txt" || true
+        grep -rhE -B2 -A2 "${F1TV_DEBUG_GREP}" "${decompiled}" --include='*.smali' 2>/dev/null \
+            | head -c 2000000 > "${F1TV_DEBUG_DIR}/grep_matches.txt" || true
+        info "Matched $(wc -l < "${F1TV_DEBUG_DIR}/grep_files.txt" 2>/dev/null || echo 0) file(s)"
+    fi
+
+    find "${decompiled}" -path '*tiledmedia*' -name '*.smali' 2>/dev/null \
+        | sed "s|${decompiled}/||" | sort > "${F1TV_DEBUG_DIR}/tiledmedia_classes.txt" || true
+}
+
 cleanup() {
+    local rc=$?
     if [[ -n "${WORKDIR:-}" && -d "${WORKDIR}" ]]; then
+        if (( rc != 0 )) || [[ -n "${F1TV_DEBUG_ALWAYS:-}" ]]; then
+            save_debug_smali
+        fi
         info "Cleaning up ${WORKDIR}"
         rm -rf "${WORKDIR}"
     fi
+    return $rc
 }
 trap cleanup EXIT
 
@@ -260,9 +334,15 @@ fi
 
 # ─── Spoof device model in request header ────────────────────────────────────
 
+# The only patch that changes what the backend serves rather than how the
+# device decodes it. Set F1TV_MODEL_SPOOF=0 to let the backend see the real
+# device, e.g. to test whether a content problem is specific to the variant
+# served to the spoofed profile.
 info "Searching for TvApplication.smali..."
 TVAPP_SMALI="$(find "${DECOMPILED}" -name 'TvApplication.smali' -path '*/avs/f1/*' -print -quit)"
-if [[ -n "${TVAPP_SMALI}" ]]; then
+if [[ "${F1TV_MODEL_SPOOF:-1}" == "0" ]]; then
+    warn "F1TV_MODEL_SPOOF=0 — leaving Build.MODEL unspoofed (backend sees the real device)"
+elif [[ -n "${TVAPP_SMALI}" ]]; then
     ok "Found: ${TVAPP_SMALI#${WORKDIR}/}"
     info "Spoofing device model as Chromecast in request header..."
     python3 - "${TVAPP_SMALI}" << 'PYEOF'
@@ -304,7 +384,7 @@ if [[ -n "${DECODER_CAP_SMALI}" ]]; then
     ok "Found: ${DECODER_CAP_SMALI#${WORKDIR}/}"
     info "Patching ClearVR decoder capability reporting..."
     python3 - "${DECODER_CAP_SMALI}" << 'PYEOF'
-import sys
+import os, sys
 
 smali_path = sys.argv[1]
 with open(smali_path, 'r') as f:
@@ -315,13 +395,26 @@ with open(smali_path, 'r') as f:
 # Devices without a ClearVR quirk profile report 0 for tile slots/rows/cols,
 # causing the backend to serve a lower resolution tier (2880x1620 instead of 3840x2160).
 
-patches = [
-    # Override secureDecoderMaximumTileSlotCount: 0 → 16 (matches Oculus Go/Quest profiles)
-    (
+# maxNumberOfSecureHEVCSamples is the device's real concurrent secure-HEVC
+# session limit. Forcing it high is what unlocks the 2160p tier, but it also
+# tells the backend the device can sustain more simultaneous secure sessions
+# than the hardware may actually have. F1TV_SECURE_HEVC_SAMPLES makes that
+# tunable: an integer to force a specific count, or "keep" to leave the real
+# probed value untouched.
+samples = os.environ.get('F1TV_SECURE_HEVC_SAMPLES', '16').strip() or '16'
+
+patches = []
+if samples.lower() == 'keep':
+    print("  Leaving maxNumberOfSecureHEVCSamples at the hardware-probed value")
+else:
+    n = int(samples, 0)
+    patches.append((
         '    iget v2, p0, Lcom/tiledmedia/clearvrdecoder/util/DecoderCapability;->maxNumberOfSecureHEVCSamples:I',
-        '    const/16 v2, 0x10',
-        'secureDecoderMaximumTileSlotCount → 16'
-    ),
+        f'    const/16 v2, {n:#x}',
+        f'secureDecoderMaximumTileSlotCount → {n}'
+    ))
+
+patches += [
     # Override maxTileRows: 0 → 5 (matches Chromecast/Google TV profile)
     (
         '    iget v2, p0, Lcom/tiledmedia/clearvrdecoder/util/DecoderCapability;->maxTileRows:I',
@@ -345,7 +438,7 @@ for old, new, desc in patches:
     else:
         print(f"  WARNING: Could not find pattern for {desc}, skipping")
 
-if patched == 0:
+if patched == 0 and samples.lower() != 'keep':
     print("ERROR: No ClearVR capability patches applied!", file=sys.stderr)
     sys.exit(1)
 
@@ -494,12 +587,20 @@ with open(path, 'r') as f:
 
 # Replace getDefaultDisplaySize() body with a hardcoded 3840x2160 Point.
 # 0xf00 = 3840, 0x870 = 2160. Result is also cached in trueDisplaySize.
-pattern = (
-    r'\.method private static getDefaultDisplaySize\(Landroid/content/Context;\)Landroid/graphics/Point;'
+#
+# The parameter type is captured rather than hardcoded: ClearVR SP164.9.0
+# changed it from Landroid/content/Context; to Landroid/app/Activity;, which
+# silently broke this patch. Reusing whatever the method actually declares
+# keeps the rewrite valid across that kind of signature churn.
+pattern = re.compile(
+    r'\.method private static getDefaultDisplaySize\((?P<arg>L[^;)]+;)\)Landroid/graphics/Point;'
     r'.*?'
-    r'\.end method'
+    r'\.end method',
+    re.DOTALL,
 )
-replacement = """.method private static getDefaultDisplaySize(Landroid/content/Context;)Landroid/graphics/Point;
+
+def replacement(match):
+    return f""".method private static getDefaultDisplaySize({match.group('arg')})Landroid/graphics/Point;
     .locals 3
 
     # UHD Patch: always report a 3840x2160 panel
@@ -509,14 +610,14 @@ replacement = """.method private static getDefaultDisplaySize(Landroid/content/C
 
     const/16 v2, 0x870
 
-    invoke-direct {v0, v1, v2}, Landroid/graphics/Point;-><init>(II)V
+    invoke-direct {{v0, v1, v2}}, Landroid/graphics/Point;-><init>(II)V
 
     sput-object v0, Lcom/tiledmedia/clearvrview/TrueTVDisplaySizeHelper;->trueDisplaySize:Landroid/graphics/Point;
 
     return-object v0
 .end method"""
 
-content, count = re.subn(pattern, replacement, content, flags=re.DOTALL)
+content, count = pattern.subn(replacement, content)
 if count == 0:
     print("ERROR: getDefaultDisplaySize not found", file=sys.stderr)
     sys.exit(1)
