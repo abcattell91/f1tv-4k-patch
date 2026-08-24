@@ -35,7 +35,14 @@ PATCHED_CLASSES=(
 )
 
 # Copy the classes we patch (plus a full tiledmedia class listing, so renamed or
-# relocated classes are visible) into F1TV_DEBUG_DIR. Only runs on failure.
+# relocated classes are visible) into F1TV_DEBUG_DIR. Runs on failure, or on any
+# exit when F1TV_DEBUG_ALWAYS is set.
+#
+# Two knobs help investigate runtime faults, where the patch applies cleanly but
+# the app misbehaves on device and the interesting class is unknown up front:
+#   F1TV_DEBUG_EXTRA_CLASSES  space/comma-separated extra class basenames to save
+#   F1TV_DEBUG_GREP           regex searched across the whole decompiled tree;
+#                             writes the matching files and lines to the artifact
 save_debug_smali() {
     local decompiled="${WORKDIR}/decompiled"
     [[ -n "${F1TV_DEBUG_DIR:-}" && -d "${decompiled}" ]] || return 0
@@ -55,6 +62,27 @@ save_debug_smali() {
         done < <(find "${decompiled}" -name "${class}.smali" 2>/dev/null)
     done
 
+    # Opt-in extra classes, same path-preserving copy as above.
+    local extra
+    for extra in ${F1TV_DEBUG_EXTRA_CLASSES//,/ }; do
+        while IFS= read -r path; do
+            rel="${path#${decompiled}/}"
+            mkdir -p "${F1TV_DEBUG_DIR}/$(dirname "${rel}")"
+            cp "${path}" "${F1TV_DEBUG_DIR}/${rel}"
+        done < <(find "${decompiled}" -name "${extra}.smali" 2>/dev/null)
+    done
+
+    # Opt-in tree-wide search, for tracking down an unknown class by a string or
+    # constant seen at runtime (an on-screen error code, say).
+    if [[ -n "${F1TV_DEBUG_GREP:-}" ]]; then
+        info "Searching decompiled tree for: ${F1TV_DEBUG_GREP}"
+        grep -rlE "${F1TV_DEBUG_GREP}" "${decompiled}" --include='*.smali' 2>/dev/null \
+            | sed "s|${decompiled}/||" | sort > "${F1TV_DEBUG_DIR}/grep_files.txt" || true
+        grep -rhE -B2 -A2 "${F1TV_DEBUG_GREP}" "${decompiled}" --include='*.smali' 2>/dev/null \
+            | head -c 2000000 > "${F1TV_DEBUG_DIR}/grep_matches.txt" || true
+        info "Matched $(wc -l < "${F1TV_DEBUG_DIR}/grep_files.txt" 2>/dev/null || echo 0) file(s)"
+    fi
+
     find "${decompiled}" -path '*tiledmedia*' -name '*.smali' 2>/dev/null \
         | sed "s|${decompiled}/||" | sort > "${F1TV_DEBUG_DIR}/tiledmedia_classes.txt" || true
 }
@@ -62,7 +90,9 @@ save_debug_smali() {
 cleanup() {
     local rc=$?
     if [[ -n "${WORKDIR:-}" && -d "${WORKDIR}" ]]; then
-        (( rc != 0 )) && save_debug_smali
+        if (( rc != 0 )) || [[ -n "${F1TV_DEBUG_ALWAYS:-}" ]]; then
+            save_debug_smali
+        fi
         info "Cleaning up ${WORKDIR}"
         rm -rf "${WORKDIR}"
     fi

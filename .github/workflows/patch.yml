@@ -15,6 +15,14 @@ on:
         required: false
         type: boolean
         default: false
+      debug_grep:
+        description: "Regex to search across the decompiled tree (diagnostics)"
+        required: false
+        type: string
+      debug_extra_classes:
+        description: "Extra smali class basenames to collect (space separated)"
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -429,10 +437,14 @@ jobs:
           # On failure, patch.sh saves the classes it patches here before
           # tearing down its temp dir, so a broken smali pattern is diagnosable.
           F1TV_DEBUG_DIR: ${{ github.workspace }}/debug_smali
+          F1TV_DEBUG_GREP: ${{ inputs.debug_grep }}
+          F1TV_DEBUG_EXTRA_CLASSES: ${{ inputs.debug_extra_classes }}
+          # Collect diagnostics on a green run too when one was requested.
+          F1TV_DEBUG_ALWAYS: ${{ (inputs.debug_grep != '' || inputs.debug_extra_classes != '') && '1' || '' }}
 
       # ── Preserve smali when a patch pattern stops matching ──
       - name: Upload patch debug smali
-        if: failure()
+        if: always() && hashFiles('debug_smali/**') != ''
         uses: actions/upload-artifact@v5
         with:
           name: patch-debug-smali-${{ needs.check.outputs.version_short }}
